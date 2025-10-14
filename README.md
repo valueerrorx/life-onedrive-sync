@@ -1,3 +1,5 @@
+![App UI](./ui.png)
+
 # OneDrive Authentifizierung - Electron App
 
 Diese Electron App löst das Problem der OneDrive Authentifizierung mit `onedrive abraunegg` durch eine benutzerfreundliche GUI.
