@@ -1,37 +1,35 @@
-![App UI](./ui.png)
+# OneDrive Authentication - Electron App
 
-# OneDrive Authentifizierung - Electron App
-
-Diese Electron App löst das Problem der OneDrive Authentifizierung mit `onedrive abraunegg` durch eine benutzerfreundliche GUI.
+This Electron app solves OneDrive authentication with `onedrive` (abraunegg) through a user-friendly GUI.
 
 
-## Lösung
+## Solution
 
-Diese Electron App bietet:
-- **Automatische Browser-Öffnung**: Das Auth-Fenster öffnet sich automatisch
-- **URL-Weiterleitung**: Automatische Erkennung und Weiterleitung der Auth-URL
-- **Benutzerfreundliche GUI**: Einfache Bedienung ohne manuelle URL-Eingabe
+This Electron app provides:
+- **Automatic browser opening**: The auth window opens automatically
+- **URL handoff**: Automatically detects and forwards the auth URL
+- **User-friendly GUI**: No manual URL entry required
 
-## Verwendung
+## Usage
 
-1. **App starten**:
+1. **Start the app**:
    ```bash
    npm run dev
    ```
 
-2. **OneDrive Authentifizierung**:
-   - Klicken Sie auf "OneDrive Authentifizierung starten"
-   - Ein Browser-Fenster öffnet sich automatisch
-   - Melden Sie sich bei Microsoft an
-   - Die App erkennt automatisch die Weiterleitung und schließt das Fenster
+2. **OneDrive authentication**:
+   - Click "Start OneDrive Authentication"
+   - A browser window opens automatically
+   - Sign in with your Microsoft account
+   - The app detects the redirect and closes the window
 
-3. **Status überwachen**:
-   - Alle Schritte werden in der Status-Historie angezeigt
-   - Klicken Sie auf das Info-Icon für detaillierte Meldungen
+3. **Monitor status**:
+   - All steps are shown in the status history
+   - Click the info icon for detailed messages
 
-## Technische Details
+## Technical Details
 
-### Architektur
+### Architecture
 
 ```
 Electron Main Process (index.js)
@@ -42,28 +40,28 @@ Electron Main Process (index.js)
 
 ### Workflow
 
-1. **Auth-Prozess starten**: `onedrive --auth-files request:response`
-2. **URL abwarten**: Überwachung der `request.url` Datei
-3. **Browser öffnen**: Automatisches Laden der Auth-URL
-4. **Redirect erkennen**: Automatische Erkennung der Response-URL
-5. **Response speichern**: Automatisches Schreiben in `response.url`
+1. **Start auth process**: `onedrive --auth-files request:response`
+2. **Wait for URL**: Watch the `request.url` file
+3. **Open browser**: Automatically load the auth URL
+4. **Detect redirect**: Automatically detect the response URL
+5. **Save response**: Write to `response.url`
 
-### Dateien
+### Files
 
-- `index.js`: Hauptprozess mit OneDrive Integration
-- `index.html`: Benutzeroberfläche
-- `preload.js`: IPC Bridge
+- `index.js`: Main process with OneDrive integration
+- `index.html`: User interface
+- `preload.js`: IPC bridge
 
-## Konfiguration
+## Configuration
 
-Die App verwendet die Standard OneDrive Konfiguration:
-- Config-Verzeichnis: `~/.config/onedrive`
-- Auth-Dateien: `~/.config/onedrive/auth/request.url` und `response.url`
+The app uses the default OneDrive configuration:
+- Config directory: `~/.config/onedrive`
+- Auth files: `~/.config/onedrive/auth/request.url` and `response.url`
 
-## Voraussetzungen
+## Requirements
 
-- `onedrive` (abraunegg) muss installiert sein
-- Node.js und npm
+- `onedrive` (abraunegg) must be installed
+- Node.js and npm
 - Electron
 
 ## Build
@@ -72,4 +70,6 @@ Die App verwendet die Standard OneDrive Konfiguration:
 npm run build
 ```
 
-Erstellt eine AppImage für Linux.
+Creates an AppImage for Linux.
+
+![App UI](./ui.png)
