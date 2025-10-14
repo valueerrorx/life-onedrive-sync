@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>OneDrive Authentifizierung</title>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self';">
+    <link rel="stylesheet" href="./node_modules/bootstrap/dist/css/bootstrap.min.css">
+  </head>
+  
+  <body class="d-flex flex-column align-items-center justify-content-start vh-100 bg-light pt-5">
+
+    <!-- OneDrive Logo -->
+    <div class="mb-4">
+      <img src="icon.png" alt="OneDrive Icon" width="128" height="128">
+    </div>
+  
+    <!-- Main Card -->
+    <div class="card shadow p-4 mb-3" style="width: 400px;">
+      <h4 class="text-center mb-3">OneDrive</h4>
+      
+      <div class="text-center mb-4">
+        <p class="text-muted small">Klicken Sie auf den Button, um die OneDrive Authentifizierung zu starten.</p>
+       
+      </div>
+
+      <button id="authButton" class="btn btn-primary w-100 mb-3" onclick="startAuth()">
+        OneDrive Authentifizierung starten
+      </button>
+
+      <button id="syncNowButton" class="btn btn-outline-primary w-100" onclick="syncNow()">
+        Jetzt synchronisieren
+      </button>
+
+
+    </div>
+
+
+      <div id="authStatus" class="text-center mt-3" style="min-height: 2rem; overflow: hidden; text-overflow: ellipsis; width: 400px;">
+        <span class="text-muted">Prüfe Status…</span>
+      </div>
+
+
+    <!-- Status Overlay (hidden until toggled) -->
+    <div id="statusOverlay" class="position-fixed" style="top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);display:none;z-index:2000;" onclick="hideOverlay()">
+      <div class="position-absolute" style="top: 50%; left: 50%; transform: translate(-50%, -50%); width: 80%; max-width: 600px; max-height: 80%;" onclick="event.stopPropagation()">
+        <div class="card shadow">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <h6 class="mb-0">Status-Historie</h6>
+            <div>
+              <button class="btn btn-sm btn-outline-secondary me-2" onclick="clearHistory()">Löschen</button>
+              <button class="btn btn-sm btn-outline-primary" onclick="hideOverlay()">Schließen</button>
+            </div>
+          </div>
+          <div id="statusContent" class="card-body p-2" style="max-height: 400px; overflow-y: auto;">
+            <div class="text-muted text-center py-2">Keine Meldungen</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Info icon (bottom right) -->
+    <div id="infoIcon" class="position-fixed" style="bottom: 20px; right: 20px; z-index: 1000; cursor: pointer;" onclick="toggleInfo()">
+      <div class="bg-primary text-white rounded-circle d-flex align-items-center justify-content-center" style="width: 50px; height: 50px; box-shadow: 0 2px 10px rgba(0,0,0,0.2);">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/>
+        </svg>
+      </div>
+    </div>
+
+    <script>
+        // ipcRenderer wird über preload.js bereitgestellt
+        
+        let authInProgress = false
+        
+        // Status History Management
+        const statusHistory = {
+            messages: [],
+            maxMessages: 120,
+            
+            add(message, type = 'info') {
+                const timestamp = new Date().toLocaleTimeString()
+                this.messages.unshift({
+                    timestamp,
+                    message,
+                    type,
+                    id: Date.now() + Math.random()
+                })
+                
+                if (this.messages.length > this.maxMessages) {
+                    this.messages = this.messages.slice(0, this.maxMessages)
+                }
+                
+                this.updateDisplay()
+            },
+            
+            updateDisplay() {
+                const statusDiv = document.getElementById("authStatus")
+                const content = document.getElementById("statusContent")
+                
+                if (this.messages.length === 0) {
+                    statusDiv.innerHTML = '<span class="text-muted">Bereit für Authentifizierung</span>'
+                    content.innerHTML = '<div class="text-muted text-center py-2">Keine Meldungen</div>'
+                    return
+                }
+                
+                // Show latest message in status
+                const latest = this.messages[0]
+                let alertClass = "alert-info"
+                if (latest.type === "error") alertClass = "alert-danger"
+                else if (latest.type === "warning") alertClass = "alert-warning"
+                else if (latest.type === "success" || latest.type === "completed") alertClass = "alert-success"
+                
+                // Truncate long messages for compact status bar
+                const truncated = latest.message.length > 140 ? latest.message.slice(0, 140) + '…' : latest.message
+                statusDiv.innerHTML = `<div class="alert ${alertClass} mb-0" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${truncated}</div>`
+                
+                // Update history content
+                if (content) {
+                    const html = this.messages.map(msg => {
+                        let msgClass = "text-info"
+                        if (msg.type === "error") msgClass = "text-danger"
+                        else if (msg.type === "warning") msgClass = "text-warning"
+                        else if (msg.type === "success" || msg.type === "completed") msgClass = "text-success"
+                        
+                        return `
+                            <div class="small mb-1">
+                                <span class="text-muted">${msg.timestamp}</span>
+                                <span class="${msgClass}">${msg.message}</span>
+                            </div>
+                        `
+                    }).join('')
+                    
+                    content.innerHTML = html
+                }
+            },
+            
+            clear() {
+                this.messages = []
+                this.updateDisplay()
+            }
+        }
+        
+        // Start OneDrive Authentication
+        async function startAuth() {
+            console.log('startAuth() called')
+            if (authInProgress) {
+                console.log('Auth already in progress')
+                return
+            }
+            
+            authInProgress = true
+            const button = document.getElementById('authButton')
+            button.disabled = true
+            button.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Starte Authentifizierung...'
+            
+            try {
+                statusHistory.add('Starte OneDrive Authentifizierung...', 'info')
+                console.log('Calling ipcRenderer.invoke...')
+                
+                const result = await window.ipcRenderer.invoke('start-onedrive-auth')
+                console.log('IPC result:', result)
+                
+                if (result.status === 'auth-started') {
+                    statusHistory.add('Authentifizierungsfenster geöffnet', 'info')
+                    statusHistory.add('Bitte melden Sie sich in dem geöffneten Fenster an', 'info')
+                } else {
+                    statusHistory.add('Fehler beim Starten der Authentifizierung', 'error')
+                }
+            } catch (error) {
+                console.error('Error in startAuth:', error)
+                statusHistory.add(`Fehler: ${error.message}`, 'error')
+            } finally {
+                authInProgress = false
+                button.disabled = false
+                button.textContent = 'OneDrive Authentifizierung starten'
+            }
+        }
+        
+        function showOverlay(){
+            document.getElementById('statusOverlay').style.display = 'block'
+            statusHistory.updateDisplay()
+        }
+
+        function hideOverlay(){
+            document.getElementById('statusOverlay').style.display = 'none'
+        }
+
+        // Clear history
+        function clearHistory() {
+            statusHistory.clear()
+            statusHistory.updateDisplay()
+        }
+        
+        // Toggle info (floating button)
+        function toggleInfo() { showOverlay() }
+        
+        // IPC Event Listeners
+        window.ipcRenderer.on('auth-result', (event, result) => {
+            statusHistory.add(result.message, result.status)
+            
+            if (result.status === 'completed') {
+                const button = document.getElementById('authButton')
+                button.textContent = 'Authentifizierung abgeschlossen'
+                button.classList.remove('btn-primary')
+                button.classList.add('btn-success')
+                button.disabled = true
+            }
+        })
+
+        window.ipcRenderer.on('sync-result', (event, result) => {
+            statusHistory.add(result.message || String(result), result.status || 'info')
+        })
+        
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            // Check token and adjust UI
+            window.ipcRenderer.invoke('check-token').then(({hasToken}) => {
+                const btn = document.getElementById('authButton')
+                const statusDiv = document.getElementById('authStatus')
+                if (hasToken) {
+                    btn.textContent = 'Authentifizierung vorhanden – Konto wechseln'
+                    btn.classList.remove('btn-primary')
+                    btn.classList.add('btn-outline-secondary')
+                    statusHistory.add('Token gefunden – Monitor wird automatisch gestartet', 'info')
+                    statusDiv.innerHTML = '<div class="alert alert-success mb-0">Bereit – Anmeldung vorhanden</div>'
+                } else {
+                    statusHistory.add('OneDrive Authentifizierung bereit', 'info')
+                }
+            }).catch(() => {
+                statusHistory.add('OneDrive Authentifizierung bereit', 'info')
+            })
+
+            // ensure info button toggles overlay
+            const infoIcon = document.getElementById('infoIcon')
+            if (infoIcon) infoIcon.onclick = showOverlay
+        })
+
+        // Sync now
+        async function syncNow(){
+            const btn = document.getElementById('syncNowButton')
+            btn.disabled = true
+            const original = btn.textContent
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Synchronisiere...'
+            try {
+                await window.ipcRenderer.invoke('force-sync')
+            } catch (err) {
+                statusHistory.add(`Fehler beim Sofort-Sync: ${err?.message || err}`,'error')
+            } finally {
+                btn.disabled = false
+                btn.textContent = original
+            }
+        }
+    </script>
+  </body>
+</html>
