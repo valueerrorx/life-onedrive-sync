@@ -58,6 +58,25 @@ function createTray() {
   })
 }
 
+// Enforce single-instance behavior; on second start, focus/show existing window
+const gotTheLock = app.requestSingleInstanceLock()
+if (!gotTheLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    try {
+      if (win && !win.isDestroyed()) {
+        if (win.isMinimized()) win.restore()
+        win.show()
+        win.focus()
+      } else {
+        // In rare cases, recreate if no window exists yet
+        createWindow()
+      }
+    } catch {}
+  })
+}
+
 app.whenReady().then(() => { createWindow(); createTray(); maybeStartMonitorIfToken() }) // Init app
 
 
