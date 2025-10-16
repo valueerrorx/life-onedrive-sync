@@ -199,10 +199,17 @@
             
             if (result.status === 'completed') {
                 const button = document.getElementById('authButton')
+                const syncBtn = document.getElementById('syncNowButton')
                 button.textContent = 'Authentifizierung abgeschlossen'
                 button.classList.remove('btn-primary')
                 button.classList.add('btn-success')
                 button.disabled = true
+                
+                // Sync-Button aktivieren
+                syncBtn.disabled = false
+                syncBtn.classList.remove('btn-outline-secondary')
+                syncBtn.classList.add('btn-outline-primary')
+                syncBtn.textContent = 'Jetzt synchronisieren'
             }
         })
 
@@ -215,18 +222,28 @@
             // Check token and adjust UI
             window.ipcRenderer.invoke('check-token').then(({hasToken}) => {
                 const btn = document.getElementById('authButton')
+                const syncBtn = document.getElementById('syncNowButton')
                 const statusDiv = document.getElementById('authStatus')
                 if (hasToken) {
                     btn.textContent = 'Authentifizierung vorhanden – Konto wechseln'
                     btn.classList.remove('btn-primary')
                     btn.classList.add('btn-outline-secondary')
+                    // Sync-Button aktivieren
+                    syncBtn.disabled = false
+                    syncBtn.classList.remove('btn-outline-secondary')
+                    syncBtn.classList.add('btn-outline-primary')
                     statusHistory.add('Token gefunden – Monitor wird automatisch gestartet', 'info')
                     statusDiv.innerHTML = '<div class="alert alert-success mb-0">Bereit – Anmeldung vorhanden</div>'
                 } else {
-                    statusHistory.add('OneDrive Authentifizierung bereit', 'info')
+                    // Sync-Button deaktivieren
+                    syncBtn.disabled = true
+                    syncBtn.classList.remove('btn-outline-primary')
+                    syncBtn.classList.add('btn-outline-secondary')
+                    syncBtn.textContent = 'Jetzt synchronisieren'
+                    statusHistory.add('OneDrive Authentifizierung durchführen!', 'info')
                 }
             }).catch(() => {
-                statusHistory.add('OneDrive Authentifizierung bereit', 'info')
+                statusHistory.add('OneDrive Authentifizierung durchführen!', 'info')
             })
 
             // ensure info button toggles overlay
@@ -241,12 +258,28 @@
             const original = btn.textContent
             btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Synchronisiere...'
             try {
-                await window.ipcRenderer.invoke('force-sync')
+                const result = await window.ipcRenderer.invoke('force-sync')
+                if (result.status === 'failed') {
+                    if (result.reason === 'no-token') {
+                        statusHistory.add('Kein OneDrive Token gefunden – bitte zuerst authentifizieren', 'error')
+                        // Button-Text anpassen für bessere UX
+                        btn.textContent = 'Jetzt synchronisieren (Authentifizierung erforderlich)'
+                        btn.classList.remove('btn-outline-primary')
+                        btn.classList.add('btn-outline-secondary')
+                    } else if (result.reason === 'onedrive-not-installed') {
+                        statusHistory.add('OneDrive ist nicht installiert. Bitte installieren Sie es zuerst.', 'error')
+                        btn.textContent = 'Jetzt synchronisieren (OneDrive nicht installiert)'
+                        btn.classList.remove('btn-outline-primary')
+                        btn.classList.add('btn-outline-secondary')
+                    }
+                }
             } catch (err) {
                 statusHistory.add(`Fehler beim Sofort-Sync: ${err?.message || err}`,'error')
             } finally {
                 btn.disabled = false
-                btn.textContent = original
+                if (btn.textContent === original) {
+                    btn.textContent = original
+                }
             }
         }
     </script>

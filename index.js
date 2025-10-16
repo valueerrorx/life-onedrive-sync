@@ -22,7 +22,7 @@ const ONEDRIVE_AUTH_DIR = path.join(ONEDRIVE_CONFIG_DIR, 'auth')
 const ONEDRIVE_REQUEST_FILE = path.join(ONEDRIVE_AUTH_DIR, 'request.url')
 const ONEDRIVE_RESPONSE_FILE = path.join(ONEDRIVE_AUTH_DIR, 'response.url')
 const ONEDRIVE_CONFIG_FILE = path.join(ONEDRIVE_CONFIG_DIR, 'config')
-const ONEDRIVE_DEFAULT_SYNC_DIR = path.join(os.homedir(), 'OneDrive')
+const ONEDRIVE_DEFAULT_SYNC_DIR = path.join(os.homedir(), 'OneDrive-Temp')
 
 function createWindow() {
     win = new BrowserWindow({
@@ -83,10 +83,34 @@ app.whenReady().then(() => { createWindow(); createTray(); maybeStartMonitorIfTo
 
 
 
+// Prüfe ob OneDrive installiert ist
+async function checkOnedriveInstallation() {
+  return new Promise((resolve) => {
+    const checkProcess = spawn('which', ['onedrive'])
+    
+    checkProcess.on('exit', (code) => {
+      resolve(code === 0)
+    })
+    
+    checkProcess.on('error', () => {
+      resolve(false)
+    })
+  })
+}
+
 // OneDrive Authentifizierung starten
 ipcMain.handle('start-onedrive-auth', async (event) => {
     console.log('start-onedrive-auth handler called')
     try {
+        // Prüfe zuerst, ob OneDrive installiert ist
+        const isOnedriveInstalled = await checkOnedriveInstallation()
+        if (!isOnedriveInstalled) {
+            const errorMsg = 'OneDrive ist nicht installiert. Bitte installieren Sie es zuerst.'
+            console.error('OneDrive not installed')
+            event.sender.send('auth-result', { status: 'error', message: errorMsg })
+            return { status: 'failed', reason: 'onedrive-not-installed' }
+        }
+
         console.log('Creating auth directory:', ONEDRIVE_AUTH_DIR)
         // Erstelle Auth-Verzeichnis
         await fs.mkdir(ONEDRIVE_AUTH_DIR, { recursive: true })
@@ -143,6 +167,24 @@ ipcMain.handle('start-onedrive-auth', async (event) => {
 // One-Time Synchronize on demand
 ipcMain.handle('force-sync', async () => {
   try {
+    // 0) Prüfe zuerst, ob OneDrive installiert ist
+    const isOnedriveInstalled = await checkOnedriveInstallation()
+    if (!isOnedriveInstalled) {
+      const errorMsg = 'OneDrive ist nicht installiert. Bitte installieren Sie es zuerst.'
+      win?.webContents?.send('sync-result', { status: 'error', message: errorMsg })
+      return { status: 'failed', reason: 'onedrive-not-installed' }
+    }
+
+    // 1) Prüfe, ob ein Token vorhanden ist
+    const tokenPath = path.join(ONEDRIVE_CONFIG_DIR, 'refresh_token')
+    const hasToken = fssync.existsSync(tokenPath)
+    
+    if (!hasToken) {
+      const errorMsg = 'Kein OneDrive Token gefunden – bitte zuerst authentifizieren'
+      win?.webContents?.send('sync-result', { status: 'error', message: errorMsg })
+      return { status: 'failed', reason: 'no-token' }
+    }
+
     // 1) Monitor (falls laufend) kurz stoppen
     const wasRunning = await stopOnedriveMonitorGracefully()
     if (wasRunning) {
