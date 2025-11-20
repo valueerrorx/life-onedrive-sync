@@ -24,6 +24,54 @@ const ONEDRIVE_RESPONSE_FILE = path.join(ONEDRIVE_AUTH_DIR, 'response.url')
 const ONEDRIVE_CONFIG_FILE = path.join(ONEDRIVE_CONFIG_DIR, 'config')
 const ONEDRIVE_DEFAULT_SYNC_DIR = path.join(os.homedir(), 'OneDrive-Temp')
 
+let activeAuthRun = null // Tracks the currently running auth attempt
+
+function beginAuthRun() {
+  const run = { id: Date.now(), settled: false }
+  activeAuthRun = run
+  return run
+}
+
+function settleAuthRun(run) {
+  if (!run || run.settled) return
+  run.settled = true
+  if (activeAuthRun === run) {
+    activeAuthRun = null
+  }
+}
+
+async function failAuthFlow(message, error, run = activeAuthRun) {
+  if (!run || run.settled) return
+  settleAuthRun(run)
+  const safeMessage = message || 'OneDrive Authentifizierung fehlgeschlagen'
+  if (error) {
+    console.error('Auth flow error:', error)
+  } else {
+    console.error('Auth flow error:', safeMessage)
+  }
+  try {
+    if (authWindow && !authWindow.isDestroyed()) {
+      authWindow.close()
+    }
+  } catch {}
+  authWindow = null
+  if (onedriveProcess) {
+    try { onedriveProcess.kill() } catch {}
+    onedriveProcess = null
+  }
+  uiSend('auth-result', { status: 'error', message: safeMessage })
+}
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err)
+  failAuthFlow('Unbekannter Fehler während der Authentifizierung', err)
+})
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason)
+  failAuthFlow('Unerwarteter Fehler während der Authentifizierung', reason instanceof Error ? reason : undefined)
+})
+
 function createWindow() {
     win = new BrowserWindow({
         title: "OneDrive Authentifizierung", // Title
@@ -102,12 +150,14 @@ async function checkOnedriveInstallation() {
 ipcMain.handle('start-onedrive-auth', async (event) => {
     console.log('start-onedrive-auth handler called')
     try {
+        const authRun = beginAuthRun()
         // Prüfe zuerst, ob OneDrive installiert ist
         const isOnedriveInstalled = await checkOnedriveInstallation()
         if (!isOnedriveInstalled) {
             const errorMsg = 'OneDrive ist nicht installiert. Bitte installieren Sie es zuerst.'
             console.error('OneDrive not installed')
             event.sender.send('auth-result', { status: 'error', message: errorMsg })
+            settleAuthRun(authRun)
             return { status: 'failed', reason: 'onedrive-not-installed' }
         }
 
@@ -136,7 +186,14 @@ ipcMain.handle('start-onedrive-auth', async (event) => {
     ])
     
     onedriveProcess.on('error', (err) => {
-      console.error('OneDrive process error:', err)
+      failAuthFlow('OneDrive Prozess konnte nicht gestartet werden', err, authRun)
+    })
+    onedriveProcess.on('exit', (code, signal) => {
+      onedriveProcess = null
+      if (signal === 'SIGTERM' || signal === 'SIGKILL') return
+      if (code !== 0) {
+        failAuthFlow(`OneDrive Authentifizierung fehlgeschlagen (Code ${code})`, undefined, authRun)
+      }
     })
     
     onedriveProcess.stdout.on('data', (data) => {
@@ -153,12 +210,13 @@ ipcMain.handle('start-onedrive-auth', async (event) => {
     console.log('Auth URL received:', authUrl)
     
     // Öffne Auth-Fenster
-    await openAuthWindow(authUrl)
+    await openAuthWindow(authUrl, authRun)
     console.log('Auth window opened')
     
     return { status: 'auth-started', url: authUrl }
   } catch (e) {
     console.error('OneDrive auth error:', e.message)
+    await failAuthFlow('OneDrive Authentifizierung fehlgeschlagen', e)
     event.sender.send('auth-result', { status: 'error', message: e.message })
     return { status: 'failed' }
   }
@@ -305,7 +363,7 @@ async function waitForAuthUrl() {
 }
 
 // Auth-Fenster öffnen
-async function openAuthWindow(authUrl) {
+async function openAuthWindow(authUrl, run = activeAuthRun) {
     if (authWindow) {
         authWindow.close()
     }
@@ -347,7 +405,7 @@ async function openAuthWindow(authUrl) {
   const tryHandle = (url) => {
     if (!redirectHandled && isRedirectUrl(url)) {
       redirectHandled = true
-      handleAuthRedirect(url)
+      handleAuthRedirect(url, run)
     }
   }
 
@@ -358,6 +416,12 @@ async function openAuthWindow(authUrl) {
   authWindow.webContents.setWindowOpenHandler(({ url }) => {
     tryHandle(url)
     return { action: 'deny' }
+  })
+  authWindow.once('closed', () => {
+    authWindow = null
+    if (run && !run.settled) {
+      failAuthFlow('Authentifizierung wurde abgebrochen', undefined, run)
+    }
   })
   
   // Load URL with UA and handle load failures by retrying once
@@ -398,13 +462,14 @@ sync_business_shared_items = "false"
 }
 
 // Auth-Redirect verarbeiten
-async function handleAuthRedirect(redirectUrl) {
+async function handleAuthRedirect(redirectUrl, run = activeAuthRun) {
   try {
     // Speichere Response-URL
     await fs.writeFile(ONEDRIVE_RESPONSE_FILE, redirectUrl)
     
     // Schließe Auth-Fenster
     if (authWindow) {
+      settleAuthRun(run)
       authWindow.close()
       authWindow = null
     }
@@ -439,10 +504,7 @@ async function handleAuthRedirect(redirectUrl) {
         }
     } catch (e) {
         console.error('Error handling auth redirect:', e.message)
-        win?.webContents?.send('auth-result', { 
-            status: 'error', 
-            message: 'Fehler beim Verarbeiten der Authentifizierung' 
-        })
+        await failAuthFlow('Fehler beim Verarbeiten der Authentifizierung', e, run)
     }
 }
 
