@@ -257,6 +257,7 @@
             btn.disabled = true
             const original = btn.textContent
             btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Synchronisiere...'
+            let shouldRestoreOriginal = true
             try {
                 const result = await window.ipcRenderer.invoke('force-sync')
                 if (result.status === 'failed') {
@@ -266,18 +267,21 @@
                         btn.textContent = 'Jetzt synchronisieren (Authentifizierung erforderlich)'
                         btn.classList.remove('btn-outline-primary')
                         btn.classList.add('btn-outline-secondary')
+                        shouldRestoreOriginal = false
                     } else if (result.reason === 'onedrive-not-installed') {
                         statusHistory.add('OneDrive ist nicht installiert. Bitte installieren Sie es zuerst.', 'error')
                         btn.textContent = 'Jetzt synchronisieren (OneDrive nicht installiert)'
                         btn.classList.remove('btn-outline-primary')
                         btn.classList.add('btn-outline-secondary')
+                        shouldRestoreOriginal = false
                     }
                 }
             } catch (err) {
                 statusHistory.add(`Fehler beim Sofort-Sync: ${err?.message || err}`,'error')
             } finally {
                 btn.disabled = false
-                if (btn.textContent === original) {
+                // Spinner immer entfernen, Original-Text nur wiederherstellen wenn nicht geändert
+                if (shouldRestoreOriginal) {
                     btn.textContent = original
                 }
             }
