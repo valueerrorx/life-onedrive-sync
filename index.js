@@ -23,6 +23,10 @@ const ONEDRIVE_REQUEST_FILE = path.join(ONEDRIVE_AUTH_DIR, 'request.url')
 const ONEDRIVE_RESPONSE_FILE = path.join(ONEDRIVE_AUTH_DIR, 'response.url')
 const ONEDRIVE_CONFIG_FILE = path.join(ONEDRIVE_CONFIG_DIR, 'config')
 const ONEDRIVE_DEFAULT_SYNC_DIR = path.join(os.homedir(), 'OneDrive-Temp')
+const SHARED_WITH_ME_FOLDER_NAME = 'mit dir geteilt'
+const GRAPH_DEFAULT_APP_ID = 'd50ca740-c83f-4d1b-b616-12c519384f0c'
+const GRAPH_TOKEN_URL = 'https://login.microsoftonline.com/common/oauth2/v2.0/token'
+const GRAPH_BASE = 'https://graph.microsoft.com/v1.0'
 
 let activeAuthRun = null // Tracks the currently running auth attempt
 
@@ -334,6 +338,8 @@ ipcMain.handle('check-token', async () => {
   }
 })
 
+ipcMain.handle('get-app-version', () => ({ version: app.getVersion() }))
+
 // Auth-URL aus Datei lesen
 async function waitForAuthUrl() {
   return new Promise((resolve, reject) => {
@@ -438,6 +444,55 @@ async function openAuthWindow(authUrl, run = activeAuthRun) {
   }
 }
 
+// Resolve sync_dir from config or use default (supports quoted paths and ~)
+function getSyncDirFromConfig() {
+  try {
+    const raw = fssync.readFileSync(ONEDRIVE_CONFIG_FILE, 'utf8')
+    const m = raw.match(/sync_dir\s*=\s*["']([^"']+)["']/)
+    if (m) {
+      let p = m[1].trim()
+      if (p.startsWith('~/')) p = path.join(os.homedir(), p.slice(2))
+      return path.resolve(p)
+    }
+  } catch {}
+  return ONEDRIVE_DEFAULT_SYNC_DIR
+}
+
+function getApplicationIdFromConfig() {
+  try {
+    const raw = fssync.readFileSync(ONEDRIVE_CONFIG_FILE, 'utf8')
+    const m = raw.match(/application_id\s*=\s*["']([^"']+)["']/i)
+    if (m) return m[1].trim()
+  } catch {}
+  return GRAPH_DEFAULT_APP_ID
+}
+
+// Ensure sync dir exists on disk (client may not have created it if it never ran successfully)
+async function ensureSyncDirExists() {
+  try {
+    const syncDir = getSyncDirFromConfig()
+    await fs.mkdir(syncDir, { recursive: true })
+  } catch (e) {
+    console.warn('Could not ensure sync dir:', e?.message)
+  }
+}
+
+// Ensure "mit dir geteilt" symlink only when target exists so client never hits a broken link
+async function ensureSharedWithMeLink() {
+  try {
+    const syncDir = getSyncDirFromConfig()
+    const sharedEn = path.join(syncDir, 'Files Shared With Me')
+    if (!fssync.existsSync(sharedEn)) return
+    const sharedDe = path.join(syncDir, 'mit dir geteilt')
+    if (!fssync.existsSync(sharedDe)) {
+      await fs.symlink('Files Shared With Me', sharedDe)
+      console.log('Created symlink: mit dir geteilt -> Files Shared With Me')
+    }
+  } catch (e) {
+    if (e?.code !== 'EEXIST') console.warn('Could not ensure shared-with-me link:', e?.message)
+  }
+}
+
 // Minimalen OneDrive Config schreiben, damit onedrive nicht mit "missing --sync/--monitor" abbricht
 async function ensureOnedriveConfig() {
   try {
@@ -447,13 +502,27 @@ async function ensureOnedriveConfig() {
     const hasSyncDir = /\bsync_dir\b/.test(existing)
     if (!hasSyncDir) {
       const content = `sync_dir = "${ONEDRIVE_DEFAULT_SYNC_DIR}"
-sync_business_shared_items = "false"
+sync_business_shared_items = "true"
+resync_auth = "true"
 `
       await fs.writeFile(ONEDRIVE_CONFIG_FILE, content, 'utf8')
       console.log('Wrote minimal OneDrive config at', ONEDRIVE_CONFIG_FILE)
-      // ensure local sync dir exists
-      try { await fs.mkdir(ONEDRIVE_DEFAULT_SYNC_DIR, { recursive: true }) } catch {}
+      await ensureSyncDirExists()
+      await ensureSharedWithMeLink()
     } else {
+      // Ensure shared items and non-interactive resync are enabled
+      let updated = existing
+      if (/\bsync_business_shared_items\b/.test(updated)) {
+        updated = updated.replace(/sync_business_shared_items\s*=\s*["']false["']/i, 'sync_business_shared_items = "true"')
+      } else {
+        updated += '\nsync_business_shared_items = "true"\n'
+      }
+      // resync_auth = "true" allows non-interactive resync if ever needed via CLI
+      if (!/\bresync_auth\b/.test(updated)) updated += 'resync_auth = "true"\n'
+      else updated = updated.replace(/resync_auth\s*=\s*["']false["']/i, 'resync_auth = "true"')
+      if (updated !== existing) await fs.writeFile(ONEDRIVE_CONFIG_FILE, updated, 'utf8')
+      await ensureSyncDirExists()
+      await ensureSharedWithMeLink()
       console.log('Using existing OneDrive config at', ONEDRIVE_CONFIG_FILE)
     }
   } catch (e) {
@@ -570,6 +639,8 @@ function maybeStartMonitorIfToken() {
   try {
     const tokenPath = path.join(ONEDRIVE_CONFIG_DIR, 'refresh_token')
     if (fssync.existsSync(tokenPath)) {
+      ensureSyncDirExists().catch(() => {})
+      ensureSharedWithMeLink().catch(() => {})
       startOnedriveMonitor()
     } else {
       uiSend('auth-result', { status: 'info', message: 'Kein gespeichertes Token gefunden – bitte authentifizieren' })
