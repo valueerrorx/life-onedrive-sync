@@ -33,7 +33,7 @@
     </div>
 
 
-      <div id="authStatus" class="text-center mt-3" style="min-height: 2rem; overflow: hidden; text-overflow: ellipsis; width: 400px;">
+      <div id="authStatus" class="text-center mt-3" style="min-height: 2rem; overflow: hidden; text-overflow: ellipsis; width: 400px; font-size: 13px;">
         <span class="text-muted">Prüfe Status…</span>
       </div>
 
@@ -49,7 +49,7 @@
               <button class="btn btn-sm btn-outline-primary" onclick="hideOverlay()">Schließen</button>
             </div>
           </div>
-          <div id="statusContent" class="card-body p-2" style="max-height: 400px; overflow-y: auto;">
+          <div id="statusContent" class="card-body p-2" style="max-height: 400px; overflow-y: auto; font-size: 12px;">
             <div class="text-muted text-center py-2">Keine Meldungen</div>
           </div>
         </div>
@@ -79,10 +79,12 @@
             maxMessages: 120,
             
             add(message, type = 'info') {
+                const str = typeof message === 'string' ? message : (message?.message != null ? String(message.message) : '')
+                if (!str) return
                 const timestamp = new Date().toLocaleTimeString()
                 this.messages.unshift({
                     timestamp,
-                    message,
+                    message: str,
                     type,
                     id: Date.now() + Math.random()
                 })
@@ -104,16 +106,14 @@
                     return
                 }
                 
-                // Show latest message in status
                 const latest = this.messages[0]
+                const latestText = typeof latest.message === 'string' ? latest.message : ''
                 let alertClass = "alert-info"
                 if (latest.type === "error") alertClass = "alert-danger"
                 else if (latest.type === "warning") alertClass = "alert-warning"
                 else if (latest.type === "success" || latest.type === "completed") alertClass = "alert-success"
-                
-                // Truncate long messages for compact status bar
-                const truncated = latest.message.length > 140 ? latest.message.slice(0, 140) + '…' : latest.message
-                statusDiv.innerHTML = `<div class="alert ${alertClass} mb-0" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${truncated}</div>`
+                const truncated = latestText.length > 140 ? latestText.slice(0, 140) + '…' : latestText
+                statusDiv.innerHTML = `<div class="alert ${alertClass} mb-0" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px;">${truncated}</div>`
                 
                 // Update history content
                 if (content) {
@@ -124,9 +124,9 @@
                         else if (msg.type === "success" || msg.type === "completed") msgClass = "text-success"
                         
                         return `
-                            <div class="small mb-1">
+                            <div class="mb-1" style="font-size: 12px;">
                                 <span class="text-muted">${msg.timestamp}</span>
-                                <span class="${msgClass}">${msg.message}</span>
+                                <span class="${msgClass}">${typeof msg.message === 'string' ? msg.message : ''}</span>
                             </div>
                         `
                     }).join('')
@@ -215,7 +215,8 @@
         })
 
         window.ipcRenderer.on('sync-result', (event, result) => {
-            statusHistory.add(result.message || String(result), result.status || 'info')
+            const msg = (result && typeof result.message === 'string') ? result.message : (typeof result === 'string' ? result : '')
+            if (msg) statusHistory.add(msg, result.status || 'info')
         })
         
         // Initialize

@@ -14,7 +14,10 @@ let tray // Tray ref
 let authWindow = null // OneDrive auth window
 let onedriveProcess = null // OneDrive process
 let onedriveMonitorProcess = null // OneDrive monitor process
+let sharedSyncIntervalId = null // Periodic SHARED folder refresh
 let isQuitting = false // App shutdown flag
+
+const SHARED_SYNC_INTERVAL_MS = 20 * 1000 // 20 seconds for teacher-shared files to appear
 
 // OneDrive configuration paths
 const ONEDRIVE_CONFIG_DIR = path.join(os.homedir(), '.config', 'onedrive')
@@ -23,7 +26,7 @@ const ONEDRIVE_REQUEST_FILE = path.join(ONEDRIVE_AUTH_DIR, 'request.url')
 const ONEDRIVE_RESPONSE_FILE = path.join(ONEDRIVE_AUTH_DIR, 'response.url')
 const ONEDRIVE_CONFIG_FILE = path.join(ONEDRIVE_CONFIG_DIR, 'config')
 const ONEDRIVE_DEFAULT_SYNC_DIR = path.join(os.homedir(), 'OneDrive-Temp')
-const SHARED_WITH_ME_FOLDER_NAME = 'mit dir geteilt'
+const SHARED_FOLDER_NAME = 'SHARED-READONLY'
 const GRAPH_DEFAULT_APP_ID = 'd50ca740-c83f-4d1b-b616-12c519384f0c'
 const GRAPH_TOKEN_URL = 'https://login.microsoftonline.com/common/oauth2/v2.0/token'
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0'
@@ -482,11 +485,17 @@ async function ensureSyncDirExists() {
   }
 }
 
-// "mit dir geteilt" as real folder for Graph API shared-with-me sync (not symlink)
+// "SHARED-READONLY" as real folder for Graph Search API shared-with-me sync (not symlink)
 async function ensureSharedWithMeDir() {
   try {
     const syncDir = getSyncDirFromConfig()
-    const sharedDir = path.join(syncDir, SHARED_WITH_ME_FOLDER_NAME)
+    const sharedDir = path.join(syncDir, SHARED_FOLDER_NAME)
+    if (SHARED_FOLDER_NAME === 'SHARED-READONLY') {
+      const oldDir = path.join(syncDir, 'SHARED')
+      const oldExists = await fs.stat(oldDir).then((s) => s.isDirectory()).catch(() => false)
+      const newExists = await fs.stat(sharedDir).then(() => true).catch(() => false)
+      if (oldExists && !newExists) await fs.rename(oldDir, sharedDir)
+    }
     const stat = await fs.stat(sharedDir).catch(() => null)
     if (stat?.isSymbolicLink()) await fs.unlink(sharedDir)
     if (!stat || stat.isSymbolicLink()) await fs.mkdir(sharedDir, { recursive: true })
@@ -522,20 +531,78 @@ async function refreshGraphAccessToken() {
   return data.access_token
 }
 
-// Fetch all items from sharedWithMe (paginated)
-async function fetchSharedWithMeAll(accessToken) {
-  const items = []
-  let url = `${GRAPH_BASE}/me/drive/sharedWithMe`
-  while (url) {
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    })
-    if (!res.ok) throw new Error(`sharedWithMe failed: ${res.status}`)
-    const data = await res.json()
-    if (Array.isArray(data.value)) items.push(...data.value)
-    url = data['@odata.nextLink'] || null
+// Get current user's OneDrive base path for Search API NOT filter (personal site URL prefix)
+async function getMyDrivePathPrefix(accessToken) {
+  const res = await fetch(`${GRAPH_BASE}/me/drive/root?$select=webUrl`, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  })
+  if (!res.ok) throw new Error(`drive/root failed: ${res.status}`)
+  const data = await res.json()
+  const webUrl = data.webUrl || ''
+  const match = webUrl.match(/^(https:\/\/[^/]+(\/personal\/[^/]+))/i)
+  return match ? match[1] : ''
+}
+
+// One Search API page; queryString must contain a search term (path-only can return nothing)
+async function searchDriveItemsPage(accessToken, queryString, from, pageSize) {
+  const body = {
+    requests: [{
+      entityTypes: ['driveItem'],
+      query: { queryString },
+      from,
+      size: pageSize,
+      fields: ['name', 'id', 'parentReference', 'file', 'folder']
+    }]
   }
-  return items
+  const res = await fetch(`${GRAPH_BASE}/search/query`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  })
+  if (!res.ok) {
+    const t = await res.text()
+    throw new Error(`Search API failed: ${res.status} ${t}`)
+  }
+  return res.json()
+}
+
+// Fetch shared items via Microsoft Graph Search API (replaces deprecated sharedWithMe; files and folders)
+async function fetchSharedViaSearch(accessToken) {
+  const myPath = await getMyDrivePathPrefix(accessToken)
+  const notPath = myPath ? ` NOT path:"${myPath}"` : ''
+  const pathFilter = `path:"https://*-my.sharepoint.com/personal/"${notPath}`
+  const seen = new Set()
+  const items = []
+  const pageSize = 100
+  for (const isDoc of [false, true]) {
+    const kql = isDoc ? `isDocument:true AND ${pathFilter}` : `isDocument:false AND ${pathFilter}`
+    let from = 0
+    let more = true
+    while (more) {
+      const data = await searchDriveItemsPage(accessToken, kql, from, pageSize)
+      const container = data.value?.[0]?.hitsContainers?.[0]
+      if (!container) break
+      const hits = container.hits || []
+      for (const hit of hits) {
+        const resource = hit.resource
+        if (resource?.parentReference?.driveId && resource?.id && !seen.has(resource.id)) {
+          seen.add(resource.id)
+          items.push(resource)
+        }
+      }
+      more = container.moreResultsAvailable === true
+      from += pageSize
+    }
+  }
+  // Only sync top-level shared items; skip children (they are synced when we recurse into their parent folder)
+  const allIds = new Set(items.map((i) => i.id))
+  return items.filter((i) => {
+    const parentId = i.parentReference?.id
+    return !parentId || !allIds.has(parentId)
+  })
 }
 
 // Sanitize name for filesystem (one line)
@@ -544,13 +611,18 @@ function sanitizeFileName(name) {
   return name.replace(/[/\\:*?"<>|]/g, '_').slice(0, 200).trim() || 'unnamed'
 }
 
-// Download one file from Graph to local path
+// Download one file from Graph to local path; skip if local file exists and is not older than remote
 async function downloadGraphFile(accessToken, driveId, itemId, localPath) {
   const res = await fetch(`${GRAPH_BASE}/drives/${driveId}/items/${itemId}`, {
     headers: { Authorization: `Bearer ${accessToken}` }
   })
   if (!res.ok) throw new Error(`get item ${res.status}`)
   const item = await res.json()
+  const remoteMtime = item.lastModifiedDateTime ? new Date(item.lastModifiedDateTime).getTime() : 0
+  try {
+    const st = await fs.stat(localPath)
+    if (st.isFile() && remoteMtime > 0 && st.mtimeMs >= remoteMtime) return
+  } catch {}
   const downloadUrl = item['@microsoft.graph.downloadUrl']
   if (!downloadUrl) throw new Error('No download URL')
   const fileRes = await fetch(downloadUrl)
@@ -574,39 +646,54 @@ async function graphListChildren(accessToken, driveId, itemId) {
 }
 
 // Sync one shared item (file or folder) into localDir; item has .remoteItem or is plain driveItem with .parentReference
-async function syncSharedItemToLocal(accessToken, item, localDir) {
+async function syncSharedItemToLocal(accessToken, item, localDir, quiet = false) {
   const remote = item.remoteItem || item
-  const driveId = remote.parentReference?.driveId
-  const itemId = remote.id
+  let driveId = remote.parentReference?.driveId
+  let itemId = remote.id
   if (!driveId || !itemId) return
-  const name = sanitizeFileName(remote.name || 'unnamed')
+  let name = sanitizeFileName(remote.name || 'unnamed')
+  let isFile = remote.file != null
+  let isFolder = remote.folder != null
+  if (!isFile && !isFolder) {
+    const full = await fetch(`${GRAPH_BASE}/drives/${driveId}/items/${itemId}?$select=name,file,folder,parentReference`, {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    }).then((r) => (r.ok ? r.json() : null))
+    if (!full) return
+    isFile = full.file != null
+    isFolder = full.folder != null
+    if (full.name) name = sanitizeFileName(full.name)
+  }
   const localPath = path.join(localDir, name)
-  if (remote.file) {
+  if (isFile) {
     await downloadGraphFile(accessToken, driveId, itemId, localPath)
-    uiSend('sync-result', { status: 'info', message: `Geteilt: ${name}` })
-  } else if (remote.folder) {
+    if (!quiet) uiSend('sync-result', { status: 'info', message: `Geteilt: ${name}` })
+  } else if (isFolder) {
     await fs.mkdir(localPath, { recursive: true })
     const children = await graphListChildren(accessToken, driveId, itemId)
-    for (const child of children) await syncSharedItemToLocal(accessToken, child, localPath)
+    for (const child of children) await syncSharedItemToLocal(accessToken, child, localPath, quiet)
   }
 }
 
-// Run full "shared with me" sync into "mit dir geteilt" via Graph API (no manual shortcuts needed)
-async function runSharedWithMeSync() {
+// Run full "shared with me" sync into "SHARED-READONLY" via Graph Search API (files and folders, no deprecated API)
+// quiet: when true (e.g. from 20s interval), do not send UI messages so "Sync complete" stays visible
+async function runSharedWithMeSync(quiet = false) {
   await ensureSharedWithMeDir()
-  const sharedDir = path.join(getSyncDirFromConfig(), SHARED_WITH_ME_FOLDER_NAME)
+  const sharedDir = path.join(getSyncDirFromConfig(), SHARED_FOLDER_NAME)
   const accessToken = await refreshGraphAccessToken()
-  uiSend('sync-result', { status: 'info', message: '„Mit dir geteilt“ wird aktualisiert…' })
-  const items = await fetchSharedWithMeAll(accessToken)
+  if (!quiet) uiSend('sync-result', { status: 'info', message: 'SHARED-READONLY wird aktualisiert…' })
+  const items = await fetchSharedViaSearch(accessToken)
   for (const item of items) {
     try {
-      await syncSharedItemToLocal(accessToken, item, sharedDir)
+      await syncSharedItemToLocal(accessToken, item, sharedDir, quiet)
     } catch (e) {
       console.warn('Shared item sync failed:', e?.message)
-      uiSend('sync-result', { status: 'warning', message: `Geteiltes Element fehlgeschlagen: ${e?.message}` })
+      if (!quiet) uiSend('sync-result', { status: 'warning', message: `Geteiltes Element fehlgeschlagen: ${e?.message}` })
     }
   }
-  uiSend('sync-result', { status: 'success', message: `„Mit dir geteilt“: ${items.length} Elemente aktualisiert` })
+  if (!quiet) {
+    uiSend('sync-result', { status: 'success', message: `SHARED-READONLY: ${items.length} Elemente aktualisiert` })
+    uiSend('sync-result', { status: 'success', message: 'Sync with Microsoft OneDrive is complete' })
+  }
 }
 
 // Minimalen OneDrive Config schreiben, damit onedrive nicht mit "missing --sync/--monitor" abbricht
@@ -617,24 +704,31 @@ async function ensureOnedriveConfig() {
     try { existing = await fs.readFile(ONEDRIVE_CONFIG_FILE, 'utf8') } catch { existing = '' }
     const hasSyncDir = /\bsync_dir\b/.test(existing)
     if (!hasSyncDir) {
+      // sync_business_shared_items = true: "Shortcut to My files" folders sync two-way (e.g. Abgabe-Ordner)
       const content = `sync_dir = "${ONEDRIVE_DEFAULT_SYNC_DIR}"
-sync_business_shared_items = "false"
+sync_business_shared_items = "true"
 resync_auth = "true"
+skip_dir = "/SHARED-READONLY"
 `
       await fs.writeFile(ONEDRIVE_CONFIG_FILE, content, 'utf8')
       console.log('Wrote minimal OneDrive config at', ONEDRIVE_CONFIG_FILE)
       await ensureSyncDirExists()
       await ensureSharedWithMeDir()
     } else {
-      // Shared items: we use Graph API in "mit dir geteilt", so client shared sync can stay false
+      // sync_business_shared_items = true: client syncs "Files Shared With Me" (shortcuts to My files) two-way for Abgabe
       let updated = existing
       if (/\bsync_business_shared_items\b/.test(updated)) {
-        updated = updated.replace(/sync_business_shared_items\s*=\s*["']true["']/i, 'sync_business_shared_items = "false"')
+        updated = updated.replace(/sync_business_shared_items\s*=\s*["']false["']/i, 'sync_business_shared_items = "true"')
       }
-      if (!/\bsync_business_shared_items\b/.test(updated)) updated += '\nsync_business_shared_items = "false"\n'
+      if (!/\bsync_business_shared_items\b/.test(updated)) updated += '\nsync_business_shared_items = "true"\n'
       // resync_auth = "true" allows non-interactive resync if ever needed via CLI
       if (!/\bresync_auth\b/.test(updated)) updated += 'resync_auth = "true"\n'
       else updated = updated.replace(/resync_auth\s*=\s*["']false["']/i, 'resync_auth = "true"')
+      // SHARED-READONLY must not be synced to main OneDrive (it's our local mirror of "shared with me")
+      if (!/\bskip_dir\b/.test(updated)) updated += 'skip_dir = "/SHARED-READONLY"\n'
+      else if (!/\/SHARED-READONLY/.test(updated)) {
+        updated = updated.replace(/(skip_dir\s*=\s*["'])([^"']*)(["'])/, (_, pre, val, suf) => `${pre}${val ? val + '|' : ''}/SHARED-READONLY${suf}`)
+      }
       if (updated !== existing) await fs.writeFile(ONEDRIVE_CONFIG_FILE, updated, 'utf8')
       await ensureSyncDirExists()
       await ensureSharedWithMeDir()
@@ -692,9 +786,25 @@ async function handleAuthRedirect(redirectUrl, run = activeAuthRun) {
     }
 }
 
+function stopSharedSyncInterval() {
+  if (sharedSyncIntervalId) {
+    clearInterval(sharedSyncIntervalId)
+    sharedSyncIntervalId = null
+  }
+}
+
+function startSharedSyncInterval() {
+  stopSharedSyncInterval()
+  sharedSyncIntervalId = setInterval(() => {
+    if (isQuitting) return
+    runSharedWithMeSync(true).catch(() => {})
+  }, SHARED_SYNC_INTERVAL_MS)
+}
+
 // Cleanup beim Beenden
 app.on('before-quit', async () => {
   isQuitting = true
+  stopSharedSyncInterval()
   if (onedriveProcess) {
     onedriveProcess.kill()
   }
@@ -725,24 +835,20 @@ function startOnedriveMonitor() {
       for (const line of lines) {
         const msg = line.trim()
         if (!msg) continue
-        const isComplete = /Sync with Microsoft OneDrive is complete/i.test(msg)
-        uiSend('sync-result', { status: isComplete ? 'success' : 'info', message: msg })
+        if (/Sync with Microsoft OneDrive is complete/i.test(msg)) {
+          uiSend('sync-result', { status: 'success', message: 'Sync with Microsoft OneDrive is complete' })
+        }
       }
     })
     onedriveMonitorProcess.stderr?.on('data', (d) => {
       const text = d.toString()
       console.log('Monitor stderr:', text)
-      const lines = text.split(/\r?\n/)
-      for (const line of lines) {
-        const msg = line.trim()
-        if (!msg) continue
-        uiSend('sync-result', { status: 'warning', message: msg })
-      }
     })
     onedriveMonitorProcess.on('exit', (code) => {
       console.log('Monitor exited with code', code)
     })
     uiSend('auth-result', { status: 'info', message: 'OneDrive Monitor gestartet' })
+    startSharedSyncInterval()
   } catch (e) {
     console.error('Could not start OneDrive monitor:', e?.message)
     uiSend('auth-result', { status: 'error', message: 'Konnte OneDrive Monitor nicht starten' })
