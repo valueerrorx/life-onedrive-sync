@@ -91,6 +91,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.PAT_VALUEERROR }}
       - name: Changelog
         run: |
           set -euo pipefail
@@ -118,8 +119,8 @@ jobs:
           path: release-assets
       - name: Create GitHub release
         env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT_VALUEERROR }}
+          GITHUB_TOKEN: ${{ secrets.PAT_VALUEERROR }}
         run: |
           set -euo pipefail
           TAG="v${{ needs.check-version.outputs.version }}"
