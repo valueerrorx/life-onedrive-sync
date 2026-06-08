@@ -14,6 +14,7 @@
     "appId": "eu.life-edu.lifeonedrivesync",
     "productName": "LiFE-OneDrive-Sync",
     "icon": "icon.png",
+    "publish": null,
     "linux": {
       "target": "AppImage",
       "category": "Utility"
