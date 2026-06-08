@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu } from 'electron' // Electron core modules
+import { app, BrowserWindow, ipcMain, Tray, Menu, dialog } from 'electron' // Electron core modules
 import os from 'os' // OS utilities
 import fs from 'fs/promises' // Promise-based FS API
 import fssync from 'fs' // Sync FS API
@@ -16,6 +16,7 @@ let onedriveProcess = null // OneDrive process
 let onedriveMonitorProcess = null // OneDrive monitor process
 let sharedSyncIntervalId = null // Periodic SHARED folder refresh
 let isQuitting = false // App shutdown flag
+let lastSharedOrphansSignature = '' // Tracks last set of orphan paths in OneDrive-Shared
 
 const SHARED_SYNC_INTERVAL_MS = 20 * 1000 // 20 seconds for teacher-shared files to appear
 
@@ -25,8 +26,8 @@ const ONEDRIVE_AUTH_DIR = path.join(ONEDRIVE_CONFIG_DIR, 'auth')
 const ONEDRIVE_REQUEST_FILE = path.join(ONEDRIVE_AUTH_DIR, 'request.url')
 const ONEDRIVE_RESPONSE_FILE = path.join(ONEDRIVE_AUTH_DIR, 'response.url')
 const ONEDRIVE_CONFIG_FILE = path.join(ONEDRIVE_CONFIG_DIR, 'config')
-const ONEDRIVE_DEFAULT_SYNC_DIR = path.join(os.homedir(), 'OneDrive-Temp')
-const SHARED_FOLDER_NAME = 'SHARED-READONLY'
+const ONEDRIVE_DEFAULT_SYNC_DIR = path.join(os.homedir(), 'OneDrive-Personal')
+const ONEDRIVE_SHARED_DIR = path.join(os.homedir(), 'OneDrive-Shared')
 const GRAPH_DEFAULT_APP_ID = 'd50ca740-c83f-4d1b-b616-12c519384f0c'
 const GRAPH_TOKEN_URL = 'https://login.microsoftonline.com/common/oauth2/v2.0/token'
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0'
@@ -92,7 +93,19 @@ function createWindow() {
     win.removeMenu() // Hide menu
 
     win.on('close', (event) => {
-         if (!app.isQuiting) { event.preventDefault(); win.hide() } // Minimize to tray
+        if (app.isQuiting) return
+        // Schließen minimiert in den Tray statt zu beenden; vorher bestätigen lassen
+        event.preventDefault()
+        const result = dialog.showMessageBoxSync(win, {
+            type: 'info',
+            buttons: ['In den Infobereich minimieren', 'Abbrechen'],
+            defaultId: 0,
+            cancelId: 1,
+            title: 'Fenster schließen',
+            message: 'Der OneDrive-Sync-Client läuft im Hintergrund weiter.',
+            detail: 'Das Fenster wird in den Infobereich (System-Tray) minimiert. Die Synchronisierung bleibt aktiv. Zum vollständigen Beenden den Tray-Eintrag „Quit“ verwenden.'
+        })
+        if (result === 0) win.hide() // Minimize to tray
     })
 }
 
@@ -466,6 +479,11 @@ function getSyncDirFromConfig() {
   return ONEDRIVE_DEFAULT_SYNC_DIR
 }
 
+// Shared-with-me sync target: separate root folder (not inside personal OneDrive)
+function getSharedSyncDir() {
+  return ONEDRIVE_SHARED_DIR
+}
+
 function getApplicationIdFromConfig() {
   try {
     const raw = fssync.readFileSync(ONEDRIVE_CONFIG_FILE, 'utf8')
@@ -485,22 +503,149 @@ async function ensureSyncDirExists() {
   }
 }
 
-// "SHARED-READONLY" as real folder for Graph Search API shared-with-me sync (not symlink)
-async function ensureSharedWithMeDir() {
+// OneDrive-Shared root for Graph API shared-with-me sync (separate from personal sync_dir)
+async function ensureSharedSyncDir() {
   try {
-    const syncDir = getSyncDirFromConfig()
-    const sharedDir = path.join(syncDir, SHARED_FOLDER_NAME)
-    if (SHARED_FOLDER_NAME === 'SHARED-READONLY') {
-      const oldDir = path.join(syncDir, 'SHARED')
-      const oldExists = await fs.stat(oldDir).then((s) => s.isDirectory()).catch(() => false)
-      const newExists = await fs.stat(sharedDir).then(() => true).catch(() => false)
-      if (oldExists && !newExists) await fs.rename(oldDir, sharedDir)
-    }
+    const sharedDir = getSharedSyncDir()
     const stat = await fs.stat(sharedDir).catch(() => null)
     if (stat?.isSymbolicLink()) await fs.unlink(sharedDir)
     if (!stat || stat.isSymbolicLink()) await fs.mkdir(sharedDir, { recursive: true })
   } catch (e) {
-    console.warn('Could not ensure shared-with-me dir:', e?.message)
+    console.warn('Could not ensure OneDrive-Shared dir:', e?.message)
+  }
+}
+
+// Show dialog when write to OneDrive-Shared fails (no write permission / not user's file)
+function showSharedWriteErrorDialog(detail) {
+  if (isQuitting || !win?.webContents || win.isDestroyed()) return
+  dialog.showMessageBox(win, {
+    type: 'warning',
+    title: 'OneDrive-Shared: Keine Schreibrechte',
+    message: 'Sie haben auf diesem Ordner bzw. dieser Datei keine Schreibrechte, da es sich um geteilte Inhalte handelt (nicht Ihre Datei).',
+    detail: detail || ''
+  }).catch(() => {})
+}
+
+// Copy directory recursively (for moving orphans to personal OneDrive)
+async function copyDirRecursive(src, dest) {
+  await fs.mkdir(dest, { recursive: true })
+  const entries = await fs.readdir(src, { withFileTypes: true })
+  for (const e of entries) {
+    const s = path.join(src, e.name)
+    const d = path.join(dest, e.name)
+    if (e.isDirectory()) await copyDirRecursive(s, d)
+    else await fs.copyFile(s, d)
+  }
+}
+
+// Delete directory recursively (for moving orphans out of OneDrive-Shared)
+async function deleteDirRecursive(target) {
+  let entries
+  try {
+    entries = await fs.readdir(target, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const e of entries) {
+    const p = path.join(target, e.name)
+    if (e.isDirectory()) {
+      await deleteDirRecursive(p)
+    } else {
+      try {
+        await fs.unlink(p)
+      } catch {}
+    }
+  }
+  try {
+    await fs.rmdir(target)
+  } catch {}
+}
+
+// Detect files/folders in OneDrive-Shared that we did not sync (user-created); offer move to personal OneDrive
+async function checkOrphanFilesInSharedAndOfferCopy(sharedDir, syncedPaths, quiet) {
+  if (isQuitting || !win?.webContents || win.isDestroyed()) return
+
+  const orphans = []
+  async function collect(dir) {
+    let entries
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      const full = path.join(dir, e.name)
+      if (!syncedPaths.has(full)) {
+        orphans.push(full)
+      }
+      if (e.isDirectory()) {
+        await collect(full)
+      }
+    }
+  }
+
+  await collect(sharedDir)
+  if (orphans.length === 0) {
+    lastSharedOrphansSignature = ''
+    return
+  }
+
+  const sorted = [...orphans].sort()
+  const signature = sorted.join('\n')
+  if (signature === lastSharedOrphansSignature) return
+  lastSharedOrphansSignature = signature
+
+  const orphanNames = sorted.map((p) => path.relative(sharedDir, p) || path.basename(p))
+  const detail = orphanNames.slice(0, 15).join('\n') + (orphanNames.length > 15 ? `\n… und ${orphanNames.length - 15} weitere` : '')
+  const result = await dialog.showMessageBox(win, {
+    type: 'question',
+    title: 'Dateien im geteilten Ordner',
+    message: 'Diese Dateien/Ordner liegen im geteilten Ordner OneDrive-Shared und werden nicht in die Cloud synchronisiert. Sie gehen verloren, wenn sie hier gelöscht werden. In Ihren privaten OneDrive verschieben und synchronisieren, damit sie erhalten bleiben?',
+    detail,
+    buttons: ['Ja, in privaten OneDrive verschieben', 'Nein']
+  })
+  if (result.response !== 0) return
+  const personalDir = getSyncDirFromConfig()
+  try {
+    await fs.mkdir(personalDir, { recursive: true })
+  } catch (e) {
+    dialog.showMessageBox(win, { type: 'error', title: 'Fehler', message: 'Kopieren fehlgeschlagen.', detail: e?.message }).catch(() => {})
+    return
+  }
+  for (const fullPath of orphans) {
+    const relName = path.relative(sharedDir, fullPath) || path.basename(fullPath)
+    const src = fullPath
+    let dest = path.join(personalDir, relName)
+    try {
+      const st = await fs.stat(src)
+      let n = 0
+      while (true) {
+        try {
+          await fs.stat(dest)
+          n += 1
+          const ext = path.extname(relName)
+          const base = ext ? relName.slice(0, -ext.length) : relName
+          dest = path.join(personalDir, n === 1 ? `${base} (Kopie)${ext}` : `${base} (Kopie ${n})${ext}`)
+        } catch {
+          break
+        }
+      }
+      if (st.isDirectory()) {
+        await copyDirRecursive(src, dest)
+      } else {
+        const destDir = path.dirname(dest)
+        await fs.mkdir(destDir, { recursive: true })
+        await fs.copyFile(src, dest)
+      }
+      // After successful copy, remove source to actually move it out of OneDrive-Shared
+      try {
+        if (st.isDirectory()) await deleteDirRecursive(src)
+        else await fs.unlink(src)
+      } catch {}
+      uiSend('sync-result', { status: 'info', message: `Nach OneDrive verschoben: ${path.basename(dest)}` })
+    } catch (e) {
+      console.warn('Copy failed:', relName, e?.message)
+    }
   }
 }
 
@@ -544,6 +689,7 @@ async function getMyDrivePathPrefix(accessToken) {
 }
 
 // One Search API page; queryString must contain a search term (path-only can return nothing)
+// Retries transient backend errors (429/500/503 — Graph search fan-out timeouts are common) with backoff
 async function searchDriveItemsPage(accessToken, queryString, from, pageSize) {
   const body = {
     requests: [{
@@ -551,22 +697,30 @@ async function searchDriveItemsPage(accessToken, queryString, from, pageSize) {
       query: { queryString },
       from,
       size: pageSize,
-      fields: ['name', 'id', 'parentReference', 'file', 'folder']
+      fields: ['name', 'id', 'parentReference', 'file', 'folder', 'webUrl']
     }]
   }
-  const res = await fetch(`${GRAPH_BASE}/search/query`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(body)
-  })
-  if (!res.ok) {
+  const maxAttempts = 4
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch(`${GRAPH_BASE}/search/query`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    })
+    if (res.ok) return res.json()
     const t = await res.text()
+    const transient = res.status === 429 || res.status === 500 || res.status === 503
+    if (transient && attempt < maxAttempts) {
+      const delayMs = 1000 * 2 ** (attempt - 1) // 1s, 2s, 4s
+      console.warn(`Search API ${res.status}, retry ${attempt}/${maxAttempts - 1} in ${delayMs}ms`)
+      await new Promise((r) => setTimeout(r, delayMs))
+      continue
+    }
     throw new Error(`Search API failed: ${res.status} ${t}`)
   }
-  return res.json()
 }
 
 // Fetch shared items via Microsoft Graph Search API (replaces deprecated sharedWithMe; files and folders)
@@ -623,9 +777,14 @@ async function downloadGraphFile(accessToken, driveId, itemId, localPath) {
     const st = await fs.stat(localPath)
     if (st.isFile() && remoteMtime > 0 && st.mtimeMs >= remoteMtime) return
   } catch {}
+  // Prefer pre-signed URL if Graph supplied it; otherwise use the /content endpoint
+  // (Graph stopped returning @microsoft.graph.downloadUrl for shared items on foreign drives)
   const downloadUrl = item['@microsoft.graph.downloadUrl']
-  if (!downloadUrl) throw new Error('No download URL')
-  const fileRes = await fetch(downloadUrl)
+  const fileRes = downloadUrl
+    ? await fetch(downloadUrl)
+    : await fetch(`${GRAPH_BASE}/drives/${driveId}/items/${itemId}/content`, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      })
   if (!fileRes.ok) throw new Error(`download ${fileRes.status}`)
   const buf = Buffer.from(await fileRes.arrayBuffer())
   await fs.writeFile(localPath, buf)
@@ -645,8 +804,17 @@ async function graphListChildren(accessToken, driveId, itemId) {
   return items
 }
 
+// Extract owner slug from a personal SharePoint webUrl (…/personal/<owner>/…), for disambiguating duplicate names
+function ownerFromWebUrl(webUrl) {
+  const m = String(webUrl || '').match(/\/personal\/([^/]+)/i)
+  return m ? m[1] : ''
+}
+
 // Sync one shared item (file or folder) into localDir; item has .remoteItem or is plain driveItem with .parentReference
-async function syncSharedItemToLocal(accessToken, item, localDir, quiet = false) {
+// fromSearch: Search API hits report file/folder unreliably (folders come back as file:{}), so re-fetch the
+// real DriveItem to decide file vs folder. Children from graphListChildren are real DriveItems and trustworthy.
+// nameOverride: use this local name instead of the item name (e.g. disambiguated top-level name)
+async function syncSharedItemToLocal(accessToken, item, localDir, quiet = false, syncedPaths, fromSearch = false, nameOverride = '') {
   const remote = item.remoteItem || item
   let driveId = remote.parentReference?.driveId
   let itemId = remote.id
@@ -654,7 +822,7 @@ async function syncSharedItemToLocal(accessToken, item, localDir, quiet = false)
   let name = sanitizeFileName(remote.name || 'unnamed')
   let isFile = remote.file != null
   let isFolder = remote.folder != null
-  if (!isFile && !isFolder) {
+  if (fromSearch || (!isFile && !isFolder)) {
     const full = await fetch(`${GRAPH_BASE}/drives/${driveId}/items/${itemId}?$select=name,file,folder,parentReference`, {
       headers: { Authorization: `Bearer ${accessToken}` }
     }).then((r) => (r.ok ? r.json() : null))
@@ -663,37 +831,54 @@ async function syncSharedItemToLocal(accessToken, item, localDir, quiet = false)
     isFolder = full.folder != null
     if (full.name) name = sanitizeFileName(full.name)
   }
+  if (nameOverride) name = sanitizeFileName(nameOverride)
   const localPath = path.join(localDir, name)
+  if (syncedPaths) syncedPaths.add(localPath)
   if (isFile) {
     await downloadGraphFile(accessToken, driveId, itemId, localPath)
     if (!quiet) uiSend('sync-result', { status: 'info', message: `Geteilt: ${name}` })
   } else if (isFolder) {
     await fs.mkdir(localPath, { recursive: true })
     const children = await graphListChildren(accessToken, driveId, itemId)
-    for (const child of children) await syncSharedItemToLocal(accessToken, child, localPath, quiet)
+    for (const child of children) await syncSharedItemToLocal(accessToken, child, localPath, quiet, syncedPaths)
   }
 }
 
-// Run full "shared with me" sync into "SHARED-READONLY" via Graph Search API (files and folders, no deprecated API)
+// Run full "shared with me" sync into OneDrive-Shared via Graph Search API (files and folders)
 // quiet: when true (e.g. from 20s interval), do not send UI messages so "Sync complete" stays visible
 async function runSharedWithMeSync(quiet = false) {
-  await ensureSharedWithMeDir()
-  const sharedDir = path.join(getSyncDirFromConfig(), SHARED_FOLDER_NAME)
+  await ensureSharedSyncDir()
+  const sharedDir = getSharedSyncDir()
   const accessToken = await refreshGraphAccessToken()
-  if (!quiet) uiSend('sync-result', { status: 'info', message: 'SHARED-READONLY wird aktualisiert…' })
+  if (!quiet) uiSend('sync-result', { status: 'info', message: 'OneDrive-Shared wird aktualisiert…' })
   const items = await fetchSharedViaSearch(accessToken)
+  const syncedPaths = new Set()
+  // Top-level items from different owners can share a name (e.g. "Shared with Everyone"); disambiguate
+  // those by appending the owner so neither overwrites the other in the flat OneDrive-Shared root
+  const nameCounts = new Map()
+  for (const it of items) {
+    const n = sanitizeFileName((it.remoteItem || it).name || 'unnamed')
+    nameCounts.set(n, (nameCounts.get(n) || 0) + 1)
+  }
   for (const item of items) {
     try {
-      await syncSharedItemToLocal(accessToken, item, sharedDir, quiet)
+      const baseName = sanitizeFileName((item.remoteItem || item).name || 'unnamed')
+      const owner = ownerFromWebUrl(item.webUrl)
+      const nameOverride = (nameCounts.get(baseName) > 1 && owner) ? `${baseName} (${owner})` : ''
+      await syncSharedItemToLocal(accessToken, item, sharedDir, quiet, syncedPaths, true, nameOverride)
     } catch (e) {
       console.warn('Shared item sync failed:', e?.message)
-      if (!quiet) uiSend('sync-result', { status: 'warning', message: `Geteiltes Element fehlgeschlagen: ${e?.message}` })
+      // Only show the write-permission dialog for actual local write errors; other
+      // failures (e.g. Graph download issues) are logged, not surfaced as a popup
+      const isWriteErr = e?.code === 'EACCES' || e?.code === 'EPERM'
+      if (isWriteErr) showSharedWriteErrorDialog('Keine Schreibrechte auf diesem Ordner bzw. dieser Datei.')
     }
   }
   if (!quiet) {
-    uiSend('sync-result', { status: 'success', message: `SHARED-READONLY: ${items.length} Elemente aktualisiert` })
+    uiSend('sync-result', { status: 'success', message: `OneDrive-Shared: ${items.length} Elemente aktualisiert` })
     uiSend('sync-result', { status: 'success', message: 'Sync with Microsoft OneDrive is complete' })
   }
+  await checkOrphanFilesInSharedAndOfferCopy(sharedDir, syncedPaths, quiet)
 }
 
 // Minimalen OneDrive Config schreiben, damit onedrive nicht mit "missing --sync/--monitor" abbricht
@@ -708,30 +893,45 @@ async function ensureOnedriveConfig() {
       const content = `sync_dir = "${ONEDRIVE_DEFAULT_SYNC_DIR}"
 sync_business_shared_items = "true"
 resync_auth = "true"
-skip_dir = "/SHARED-READONLY"
 `
       await fs.writeFile(ONEDRIVE_CONFIG_FILE, content, 'utf8')
       console.log('Wrote minimal OneDrive config at', ONEDRIVE_CONFIG_FILE)
       await ensureSyncDirExists()
-      await ensureSharedWithMeDir()
+      await ensureSharedSyncDir()
     } else {
-      // sync_business_shared_items = true: client syncs "Files Shared With Me" (shortcuts to My files) two-way for Abgabe
       let updated = existing
       if (/\bsync_business_shared_items\b/.test(updated)) {
         updated = updated.replace(/sync_business_shared_items\s*=\s*["']false["']/i, 'sync_business_shared_items = "true"')
       }
       if (!/\bsync_business_shared_items\b/.test(updated)) updated += '\nsync_business_shared_items = "true"\n'
-      // resync_auth = "true" allows non-interactive resync if ever needed via CLI
       if (!/\bresync_auth\b/.test(updated)) updated += 'resync_auth = "true"\n'
       else updated = updated.replace(/resync_auth\s*=\s*["']false["']/i, 'resync_auth = "true"')
-      // SHARED-READONLY must not be synced to main OneDrive (it's our local mirror of "shared with me")
-      if (!/\bskip_dir\b/.test(updated)) updated += 'skip_dir = "/SHARED-READONLY"\n'
-      else if (!/\/SHARED-READONLY/.test(updated)) {
-        updated = updated.replace(/(skip_dir\s*=\s*["'])([^"']*)(["'])/, (_, pre, val, suf) => `${pre}${val ? val + '|' : ''}/SHARED-READONLY${suf}`)
-      }
+      // Migrate old default sync_dir "OneDrive-Temp" to "OneDrive-Personal"
+      try {
+        const m = updated.match(/sync_dir\s*=\s*["']([^"']+)["']/)
+        if (m && m[1]) {
+          const oldDir = m[1]
+          const base = path.basename(oldDir)
+          if (base === 'OneDrive-Temp') {
+            const parent = path.dirname(oldDir)
+            const newDir = path.join(parent, 'OneDrive-Personal')
+            try {
+              // Rename directory on disk if it exists and target does not
+              const oldStat = await fs.stat(oldDir).catch(() => null)
+              const newStat = await fs.stat(newDir).catch(() => null)
+              if (oldStat && !newStat) {
+                await fs.rename(oldDir, newDir)
+              }
+            } catch {}
+            updated = updated.replace(oldDir, newDir)
+          }
+        }
+      } catch {}
+      // Remove skip_dir: shared content now in separate root OneDrive-Shared, no ignore needed
+      updated = updated.replace(/\n?skip_dir\s*=\s*["'][^"']*["']\n?/g, '\n')
       if (updated !== existing) await fs.writeFile(ONEDRIVE_CONFIG_FILE, updated, 'utf8')
       await ensureSyncDirExists()
-      await ensureSharedWithMeDir()
+      await ensureSharedSyncDir()
       console.log('Using existing OneDrive config at', ONEDRIVE_CONFIG_FILE)
     }
   } catch (e) {
@@ -797,7 +997,13 @@ function startSharedSyncInterval() {
   stopSharedSyncInterval()
   sharedSyncIntervalId = setInterval(() => {
     if (isQuitting) return
-    runSharedWithMeSync(true).catch(() => {})
+    runSharedWithMeSync(true).catch((e) => {
+      console.warn('Background shared-with-me sync failed:', e?.message)
+      uiSend('sync-result', {
+        status: 'warning',
+        message: `OneDrive-Shared Sync Fehler: ${e?.message || 'Unbekannter Fehler'}`
+      })
+    })
   }, SHARED_SYNC_INTERVAL_MS)
 }
 
@@ -861,7 +1067,7 @@ function maybeStartMonitorIfToken() {
     const tokenPath = path.join(ONEDRIVE_CONFIG_DIR, 'refresh_token')
     if (fssync.existsSync(tokenPath)) {
       ensureSyncDirExists().catch(() => {})
-      ensureSharedWithMeDir().catch(() => {})
+      ensureSharedSyncDir().catch(() => {})
       startOnedriveMonitor()
       runSharedWithMeSync().catch(() => {})
     } else {

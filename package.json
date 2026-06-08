@@ -1,6 +1,6 @@
 {
   "name": "life-onedrive-sync",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "description": "LiFE OneDrive Sync",
   "main": "index.js",
   "type": "module",
@@ -20,9 +20,8 @@
     }
   },
   "devDependencies": {
-    "@electron/universal": "^2.0.1",
-    "electron": "^38.0.0",
-    "electron-builder": "^25.1.8"
+    "electron": "^42.3.3",
+    "electron-builder": "^26.15.2"
   },
   "dependencies": {
     "bootstrap": "^5.3.8"
